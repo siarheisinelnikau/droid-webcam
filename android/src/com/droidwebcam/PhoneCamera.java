@@ -5,51 +5,57 @@ import android.graphics.ImageFormat;
 import android.graphics.Rect;
 import android.graphics.YuvImage;
 import android.hardware.camera2.CameraCaptureSession;
-import android.hardware.camera2.CameraCharacteristics;
 import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CaptureRequest;
-import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.Image;
 import android.media.ImageReader;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.util.Range;
-import android.util.Size;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
-import java.util.Arrays;
 import java.util.Collections;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
-final class RearCamera {
-    private static final int WIDTH = 640;
-    private static final int HEIGHT = 480;
-    private static final long FRAME_NS = 1_000_000_000L / 15;
+final class PhoneCamera {
+    private final CaptureSettings settings;
+    private final String cameraId;
+    private final Range<Integer> fps;
+    private final long frameNs;
     private final CameraManager manager;
     private final Consumer<byte[]> output;
     private final Consumer<String> failure;
     private final HandlerThread thread = new HandlerThread("Droid Webcam camera");
     private final Handler handler;
+    private final HandlerThread encoderThread = new HandlerThread("Droid Webcam encoder");
+    private final Handler encoder;
     private final AtomicBoolean stopping = new AtomicBoolean();
-    private final byte[] nv21 = new byte[WIDTH * HEIGHT * 3 / 2];
+    private final byte[] nv21;
     private final ByteArrayOutputStream jpeg = new ByteArrayOutputStream(64 * 1024);
     private ImageReader reader;
     private CameraDevice camera;
     private CameraCaptureSession session;
-    private Range<Integer> fps;
     private boolean opening;
     private long nextFrame;
     private int oversized;
 
-    RearCamera(CameraManager manager, Consumer<byte[]> output, Consumer<String> failure) {
+    PhoneCamera(CameraManager manager, CameraOptions.Camera selectedCamera, CameraOptions.Mode mode,
+            CaptureSettings settings, Consumer<byte[]> output, Consumer<String> failure) {
+        this.settings = settings;
+        this.cameraId = selectedCamera.id;
+        this.fps = mode.aeRange;
+        this.frameNs = 1_000_000_000L / settings.fps;
+        this.nv21 = new byte[settings.width * settings.height * 3 / 2];
         this.manager = manager;
         this.output = output;
         this.failure = failure;
         thread.start();
         handler = new Handler(thread.getLooper());
+        encoderThread.start();
+        encoder = new Handler(encoderThread.getLooper());
     }
 
     void start() { handler.post(this::open); }
@@ -62,25 +68,12 @@ final class RearCamera {
     private void open() {
         if (stopping.get()) return;
         try {
-            for (String id : manager.getCameraIdList()) {
-                CameraCharacteristics info = manager.getCameraCharacteristics(id);
-                if (!Integer.valueOf(CameraCharacteristics.LENS_FACING_BACK)
-                        .equals(info.get(CameraCharacteristics.LENS_FACING))) continue;
-                StreamConfigurationMap map = info.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                Size[] sizes = map == null ? null : map.getOutputSizes(ImageFormat.YUV_420_888);
-                if (sizes == null || !Arrays.asList(sizes).contains(new Size(WIDTH, HEIGHT))) continue;
-                Range<Integer>[] ranges = info.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES);
-                Range<Integer> fixed = new Range<>(15, 15);
-                if (ranges != null && Arrays.asList(ranges).contains(fixed)) fps = fixed;
-                reader = ImageReader.newInstance(WIDTH, HEIGHT, ImageFormat.YUV_420_888, 2);
-                reader.setOnImageAvailableListener(this::onImage, handler);
-                manager.openCamera(id, deviceCallback, handler);
-                opening = true;
-                return;
-            }
-            fail("No rear camera supports 640×480 YUV.");
+            reader = ImageReader.newInstance(settings.width, settings.height, ImageFormat.YUV_420_888, 3);
+            reader.setOnImageAvailableListener(this::onImage, encoder);
+            manager.openCamera(cameraId, deviceCallback, handler);
+            opening = true;
         } catch (Exception error) {
-            fail("Could not open the rear camera: " + error.getMessage());
+            fail("Could not open the camera: " + error.getMessage());
         }
     }
 
@@ -102,13 +95,13 @@ final class RearCamera {
         @Override public void onDisconnected(CameraDevice device) {
             opening = false;
             camera = device;
-            fail("Rear camera disconnected.");
+            fail("Camera disconnected.");
         }
 
         @Override public void onError(CameraDevice device, int error) {
             opening = false;
             camera = device;
-            fail("Rear camera error (" + error + ").");
+            fail("Camera error (" + error + ").");
         }
     };
 
@@ -120,7 +113,7 @@ final class RearCamera {
             }
             session = configured;
             try {
-                CaptureRequest.Builder request = camera.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
+                CaptureRequest.Builder request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
                 request.addTarget(reader.getSurface());
                 if (fps != null) request.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fps);
                 session.setRepeatingRequest(request.build(), null, handler);
@@ -131,7 +124,7 @@ final class RearCamera {
 
         @Override public void onConfigureFailed(CameraCaptureSession configured) {
             configured.close();
-            fail("The rear camera rejected the capture mode.");
+            fail("The camera rejected the capture mode.");
         }
     };
 
@@ -139,21 +132,26 @@ final class RearCamera {
         if (stopping.get()) return;
         try (Image image = source.acquireLatestImage()) {
             if (image == null) return;
-            long now = System.nanoTime();
-            if (now < nextFrame) return;
-            // Preserve cadence across small callback jitter without accumulating old frames.
-            nextFrame = Math.max(now - FRAME_NS / 4, nextFrame) + FRAME_NS;
+            if (image.getWidth() != settings.width || image.getHeight() != settings.height
+                    || !image.getCropRect().equals(new Rect(0, 0, settings.width, settings.height))) {
+                throw new IOException("Camera returned an unexpected frame size");
+            }
+            long now = image.getTimestamp();
+            if (now == 0) now = System.nanoTime();
+            // Use sensor time so encoder scheduling jitter does not halve the selected FPS.
+            if (now + frameNs / 8 < nextFrame) return;
+            nextFrame = Math.max(nextFrame + frameNs, now + frameNs * 3 / 4);
             copyToNv21(image);
             jpeg.reset();
-            if (!new YuvImage(nv21, ImageFormat.NV21, WIDTH, HEIGHT, null)
-                    .compressToJpeg(new Rect(0, 0, WIDTH, HEIGHT), 75, jpeg)) {
+            if (!new YuvImage(nv21, ImageFormat.NV21, settings.width, settings.height, null)
+                    .compressToJpeg(new Rect(0, 0, settings.width, settings.height), settings.quality, jpeg)) {
                 throw new IOException("JPEG encoder failed");
             }
             if (jpeg.size() <= Connection.MAX_JPEG) {
                 oversized = 0;
                 output.accept(jpeg.toByteArray());
-            } else if (++oversized >= 15) {
-                fail("The camera repeatedly produced oversized frames.");
+            } else if (++oversized >= settings.fps) {
+                fail("Frames exceed the transport limit. Choose a lower image quality.");
             }
         } catch (Exception error) {
             fail("Capture failed: " + error.getMessage());
@@ -164,19 +162,19 @@ final class RearCamera {
         Image.Plane[] planes = image.getPlanes();
         ByteBuffer y = planes[0].getBuffer();
         int yBase = y.position();
-        for (int row = 0; row < HEIGHT; row++) {
+        for (int row = 0; row < settings.height; row++) {
             y.position(yBase + row * planes[0].getRowStride());
-            y.get(nv21, row * WIDTH, WIDTH);
+            y.get(nv21, row * settings.width, settings.width);
         }
         ByteBuffer u = planes[1].getBuffer();
         ByteBuffer v = planes[2].getBuffer();
         int uBase = u.position();
         int vBase = v.position();
-        int offset = WIDTH * HEIGHT;
-        for (int row = 0; row < HEIGHT / 2; row++) {
+        int offset = settings.width * settings.height;
+        for (int row = 0; row < settings.height / 2; row++) {
             int uRow = uBase + row * planes[1].getRowStride();
             int vRow = vBase + row * planes[2].getRowStride();
-            for (int col = 0; col < WIDTH / 2; col++) {
+            for (int col = 0; col < settings.width / 2; col++) {
                 nv21[offset++] = v.get(vRow + col * planes[2].getPixelStride());
                 nv21[offset++] = u.get(uRow + col * planes[1].getPixelStride());
             }
@@ -185,13 +183,19 @@ final class RearCamera {
 
     private void fail(String message) {
         if (stopping.compareAndSet(false, true)) failure.accept(message);
-        release();
+        // Encoding errors arrive on a separate thread. Camera state is owned by its handler.
+        handler.post(this::release);
     }
 
     private void release() {
         if (session != null) { session.close(); session = null; }
         if (camera != null) { camera.close(); camera = null; }
-        if (reader != null) { reader.close(); reader = null; }
+        ImageReader closing = reader;
+        reader = null;
+        if (closing != null) {
+            encoder.post(() -> { closing.setOnImageAvailableListener(null, null); closing.close(); });
+        }
+        encoderThread.quitSafely();
         // Wait for CameraDevice's callback so we can close a still-opening device.
         if (!opening) thread.quitSafely();
     }
