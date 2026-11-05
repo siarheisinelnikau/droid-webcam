@@ -1,0 +1,187 @@
+name: Release
+run-name: Release ${{ inputs.tag || github.ref_name }}
+
+'on':
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag matching the package version
+        required: true
+        default: v0.2.0
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    name: Validate release version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check tag and package versions
+        id: version
+        env:
+          REQUESTED_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, re, subprocess, tomllib, xml.etree.ElementTree as ET
+          tag = os.environ['REQUESTED_TAG']
+          if not re.fullmatch(r'v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?', tag):
+              raise SystemExit('Use a release tag such as v0.2.0')
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          source_version = tomllib.loads(pathlib.Path('camera-source/Cargo.toml').read_text())['package']['version']
+          android_version = ET.parse('android/AndroidManifest.xml').getroot().get('{http://schemas.android.com/apk/res/android}versionName')
+          if tag != 'v' + version or source_version != version or android_version != version:
+              raise SystemExit('The tag, Rust packages, and Android version must match')
+          if not pathlib.Path('docs/releases', tag + '.md').is_file():
+              raise SystemExit('Add release notes under docs/releases/' + tag + '.md')
+          commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'tag={tag}\nversion={version}\ncommit={commit}\n')
+          PY
+
+  windows:
+    name: Windows x64
+    needs: prepare
+    runs-on: windows-2025
+    timeout-minutes: 30
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+      - name: Build native Windows host and embedded camera source
+        shell: pwsh
+        run: ./build-windows.ps1
+      - name: Package Windows download
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path release -Force | Out-Null
+          Compress-Archive -Path dist/DroidWebcam.exe,README.md,LICENSE -DestinationPath "release/DroidWebcam-$env:VERSION-windows-x86_64.zip"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-windows
+          path: release/*.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  ubuntu:
+    name: Ubuntu x64 and transport tests
+    needs: prepare
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - name: Check formatting and Rust tests
+        run: |
+          cargo fmt --all -- --check
+          cargo test --locked --workspace
+      - name: Build Ubuntu host
+        run: ./build-ubuntu.sh
+      - name: Check Android Java transport in every mode
+        run: python3 android/tests/loopback.py dist/droid-webcam
+      - name: Package Ubuntu download
+        run: |
+          mkdir -p release
+          tar -czf "release/DroidWebcam-$VERSION-ubuntu-x86_64.tar.gz" dist/droid-webcam scripts/ubuntu-camera.sh README.md LICENSE
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-ubuntu
+          path: release/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  android:
+    name: Android APK
+    needs: prepare
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install Android SDK components
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Build and verify debug-signed APK
+        run: |
+          ./android/build.sh
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose android/build/DroidWebcam-debug.apk
+          mkdir -p release
+          cp android/build/DroidWebcam-debug.apk "release/DroidWebcam-$VERSION-android-debug.apk"
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: release-android
+          path: release/*.apk
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [prepare, windows, ubuntu, android]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
+      RELEASE_VERSION: ${{ needs.prepare.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: release-*
+          path: release
+          merge-multiple: true
+      - name: Verify downloads and publish
+        run: ./scripts/publish-release.sh
