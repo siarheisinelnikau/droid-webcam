@@ -17,21 +17,26 @@ import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
 
 final class Connection implements AutoCloseable {
-    static final int MAX_JPEG = 256 * 1024;
+    static final int MAX_JPEG = 3 * 1024 * 1024;
+    private static final int LEGACY_MAX_JPEG = 256 * 1024;
     private static final int PAIR_TIMEOUT_MS = 8000;
     private static final int FRAME_TIMEOUT_MS = 3000;
-    private static final int PAIR_PROOF = 0x44573031; // DW01
+    private static final int PAIR_PROOF = 0x44573032; // DW02
+    private static final int LEGACY_PROOF = 0x44573031;
     private static final int PAIRED = 0x44574f4b; // DWOK
+    private final int maxJpeg;
     private final SSLSocket tls;
     private final DataInputStream in;
     private final DataOutputStream out;
 
     static final class Invite {
+        final int version;
         final InetSocketAddress address;
         final byte[] pin;
         final byte[] secret;
 
-        private Invite(InetSocketAddress address, byte[] pin, byte[] secret) {
+        private Invite(int version, InetSocketAddress address, byte[] pin, byte[] secret) {
+            this.version = version;
             this.address = address;
             this.pin = pin;
             this.secret = secret;
@@ -39,7 +44,7 @@ final class Connection implements AutoCloseable {
 
         static Invite parse(String code) throws IOException {
             String[] parts = code.trim().split(":", -1);
-            if (parts.length != 6 || !parts[0].equals("droidcam") || !parts[1].equals("1")) {
+            if (parts.length != 6 || !parts[0].equals("droidcam") || !(parts[1].equals("1") || parts[1].equals("2"))) {
                 throw new IOException("Invalid invitation. Copy the entire code from the host.");
             }
             String[] ip = parts[2].split("\\.", -1);
@@ -54,7 +59,7 @@ final class Connection implements AutoCloseable {
                     || Arrays.equals(address, new byte[] {-1, -1, -1, -1})) {
                 throw new IOException("Expected a unicast host address and port.");
             }
-            return new Invite(new InetSocketAddress(host, port), hex(parts[4]), hex(parts[5]));
+            return new Invite(Integer.parseInt(parts[1]), new InetSocketAddress(host, port), hex(parts[4]), hex(parts[5]));
         }
 
         private static int parseDecimal(String value, int max) throws IOException {
@@ -75,6 +80,13 @@ final class Connection implements AutoCloseable {
     }
 
     static Connection open(Socket socket, Invite invite) throws IOException, GeneralSecurityException {
+        return open(socket, invite, invite.version == 1 ? CaptureSettings.legacy() : CaptureSettings.defaults());
+    }
+
+    static Connection open(Socket socket, Invite invite, CaptureSettings settings) throws IOException, GeneralSecurityException {
+        if (invite.version == 1 && !settings.matches(CaptureSettings.legacy().wire())) {
+            throw new IOException("Update the host to choose capture settings.");
+        }
         socket.connect(invite.address, PAIR_TIMEOUT_MS);
         socket.setTcpNoDelay(true);
         socket.setSoTimeout(PAIR_TIMEOUT_MS);
@@ -87,11 +99,17 @@ final class Connection implements AutoCloseable {
             tls.setSoTimeout(PAIR_TIMEOUT_MS);
             tls.setEnabledProtocols(new String[] { "TLSv1.3" });
             tls.startHandshake();
-            Connection connection = new Connection(tls);
-            connection.out.writeInt(PAIR_PROOF);
+            Connection connection = new Connection(tls, invite.version == 1 ? LEGACY_MAX_JPEG : MAX_JPEG);
+            connection.out.writeInt(invite.version == 1 ? LEGACY_PROOF : PAIR_PROOF);
             connection.out.write(invite.secret);
+            if (invite.version == 2) connection.out.write(settings.wire());
             connection.out.flush();
             if (connection.in.readInt() != PAIRED) throw new IOException("Host rejected pairing.");
+            if (invite.version == 2) {
+                byte[] accepted = new byte[8];
+                connection.in.readFully(accepted);
+                if (!settings.matches(accepted)) throw new IOException("Host changed the capture settings.");
+            }
             tls.setSoTimeout(FRAME_TIMEOUT_MS);
             connected = true;
             return connection;
@@ -100,14 +118,15 @@ final class Connection implements AutoCloseable {
         }
     }
 
-    private Connection(SSLSocket tls) throws IOException {
+    private Connection(SSLSocket tls, int maxJpeg) throws IOException {
+        this.maxJpeg = maxJpeg;
         this.tls = tls;
         this.in = new DataInputStream(tls.getInputStream());
         this.out = new DataOutputStream(tls.getOutputStream());
     }
 
     void send(byte[] jpeg) throws IOException {
-        if (jpeg.length == 0 || jpeg.length > MAX_JPEG) throw new IOException("Invalid JPEG size.");
+        if (jpeg.length == 0 || jpeg.length > maxJpeg) throw new IOException("Invalid JPEG size.");
         out.writeInt(jpeg.length);
         out.write(jpeg);
         out.flush();
