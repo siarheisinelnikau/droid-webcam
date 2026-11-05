@@ -74,7 +74,7 @@ impl Publisher {
                     | PIPE_NOWAIT
                     | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
-                MESSAGE as u32,
+                (2 * MESSAGE) as u32,
                 0,
                 0,
                 Some(&attributes),
@@ -96,7 +96,9 @@ impl Publisher {
         unsafe {
             if !self.connected {
                 match ConnectNamedPipe(self.pipe.0, None) {
-                    Ok(()) => self.connected = true,
+                    // In PIPE_NOWAIT mode this can mean a disconnected instance is
+                    // available again. Only ERROR_PIPE_CONNECTED confirms a client.
+                    Ok(()) => return Ok(()),
                     Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
                         self.connected = true
                     }

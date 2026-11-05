@@ -34,7 +34,7 @@ adb install -r android/build/DroidWebcam-debug.apk
 
 ## Run on Windows and Android
 
-1. Open PowerShell as administrator and run `.DroidWebcam.exe install-source` once. This is the machine-wide COM installation. Run the remaining camera commands in a regular PowerShell window.
+1. Open PowerShell as administrator in the directory containing the EXE and run `.\DroidWebcam.exe install-source` once. This is the machine-wide COM installation. Run the remaining camera commands in a regular PowerShell window.
 2. Put the phone and PC on the same LAN. Find the PC’s IPv4 address with `ipconfig`. In the example below, replace `192.168.1.42` with that address.
 
    ```powershell
@@ -43,10 +43,10 @@ adb install -r android/build/DroidWebcam-debug.apk
 
    Allow the EXE’s inbound TCP port on your private network if Windows Firewall blocks the connection. Make sure Windows camera privacy settings allow camera access for your client application.
 3. Copy the complete one-time invitation from PowerShell to the app using a transfer method you trust. Treat it as a password. Within three minutes, tap **Start** and grant camera permission if prompted. The Android app checks the host certificate before sending the secret and opens the rear camera after the host accepts it.
-4. Select **Droid Webcam** in the Windows Camera app, Zoom, Discord, or OBS under **Video Capture Device**. Windows may append “Windows Virtual Camera” to the name. Position the phone in landscape and rotate it if the picture is upside down.
+4. Select **Droid Webcam** in Windows Camera, Zoom, or Discord. In OBS, add a **Video Capture Device** and select **Droid Webcam**. Windows may append “Windows Virtual Camera” to the name. Position the phone in landscape and rotate it if the picture is upside down.
 5. Tap **Stop** on Android or press **Enter** on the PC. Leaving the Android app also stops capture. A lost connection ends the session. Run `serve` again for a new invitation.
 
-The virtual camera has current-user session lifetime and is removed when the host shuts it down. To remove the installed component, stop the host and run `.DroidWebcam.exe uninstall-source` from elevated PowerShell. If Frame Server still holds the DLL open, reboot and repeat the removal command to delete the file. See [MFCreateVirtualCamera](https://learn.microsoft.com/en-us/windows/win32/api/mfvirtualcamera/nf-mfvirtualcamera-mfcreatevirtualcamera) and [IMFVirtualCamera::Shutdown](https://learn.microsoft.com/en-us/windows/win32/api/mfvirtualcamera/nf-mfvirtualcamera-imfvirtualcamera-shutdown).
+The virtual camera has current-user session lifetime and is removed when the host shuts it down. To remove the installed component, stop the host and run `.\DroidWebcam.exe uninstall-source` from elevated PowerShell. If Frame Server still holds the DLL open, reboot and repeat the removal command to delete the file. See [MFCreateVirtualCamera](https://learn.microsoft.com/en-us/windows/win32/api/mfvirtualcamera/nf-mfvirtualcamera-mfcreatevirtualcamera) and [IMFVirtualCamera::Shutdown](https://learn.microsoft.com/en-us/windows/win32/api/mfvirtualcamera/nf-mfvirtualcamera-imfvirtualcamera-shutdown).
 
 ## Checks
 
@@ -64,11 +64,11 @@ For a manual receiver check, run `droid-webcam serve 127.0.0.1:47470` in one ter
 
 ### Device acceptance on Windows 11
 
-1. After explicitly installing the source, run `.DroidWebcam.exe test-pattern`. Open Windows Camera, select **Droid Webcam**, and confirm that the marker moves across the color bars. Repeat with an app you use.
+1. After explicitly installing the source, run `.\DroidWebcam.exe test-pattern`. Open Windows Camera, select **Droid Webcam**, and confirm that the marker moves across the color bars. Repeat with an app you use.
 2. Press **Enter** and confirm the camera disappears after refreshing the application’s device list. Start a LAN session and confirm that a real Android feed appears. Test Stop, leaving the app, disconnecting Wi-Fi, and pairing again with a fresh code.
 3. Run the elevated removal command and confirm the device is gone and the COM component is removed.
 
-The x64 Windows binary can be cross-built and inspected on Linux. Running these acceptance checks requires Windows 11 and an Android device.
+The Windows x64 release was cross-built on Ubuntu with the Rust GNU target and checked for the embedded DLL, the Media Foundation import, and the COM exports. The Android debug APK was built against SDK Platform 35 and its signature was verified. Registration, application discovery, and rear-camera capture still need the Windows 11 and Android acceptance run above.
 
 ## How frames move
 
