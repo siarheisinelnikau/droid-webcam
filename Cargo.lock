@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "droid-camera-source"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "windows",
  "windows-core",
@@ -119,12 +119,13 @@ dependencies = [
 
 [[package]]
 name = "droid-webcam"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "droid-camera-source",
  "hex",
  "jpeg-decoder",
  "jpeg-encoder",
+ "libc",
  "rcgen",
  "ring",
  "rustls",

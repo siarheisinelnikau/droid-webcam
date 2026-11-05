@@ -1,7 +1,13 @@
 //! Local, fixed-size, one-way frame handoff into the Windows Camera Frame Server.
-use crate::NV12_SIZE;
 #[cfg(feature = "com-server")]
-use crate::{HEIGHT, MAX_FRAME_AGE_MS, WIDTH};
+use crate::{
+    MAX_FRAME_AGE_MS,
+    frame::{HEADER_SIZE, black_frame, decode_packet, render_nv12},
+};
+use crate::{
+    VideoMode,
+    frame::{MAX_PACKET_SIZE, encode_packet},
+};
 #[cfg(feature = "com-server")]
 use windows::Win32::{
     Foundation::GENERIC_READ,
@@ -31,9 +37,7 @@ use windows::Win32::{
 };
 use windows::core::{Error, Result, w};
 
-const PIPE: windows::core::PCWSTR = w!(r"\\.\pipe\DroidWebcam.Frame.969b2ae1.v1");
-const HEADER: usize = 8;
-const MESSAGE: usize = HEADER + NV12_SIZE;
+const PIPE: windows::core::PCWSTR = w!(r"\\.\pipe\DroidWebcam.Frame.969b2ae1.v2");
 
 struct Handle(HANDLE);
 // An owned kernel handle can be used and closed by any thread in this process.
@@ -74,7 +78,7 @@ impl Publisher {
                     | PIPE_NOWAIT
                     | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
-                (2 * MESSAGE) as u32,
+                (2 * MAX_PACKET_SIZE) as u32,
                 0,
                 0,
                 Some(&attributes),
@@ -87,50 +91,48 @@ impl Publisher {
             Ok(Self {
                 pipe: Handle(pipe),
                 connected: false,
-                message: vec![0; MESSAGE],
+                message: Vec::new(),
             })
         }
     }
 
-    pub fn tick(&mut self, frame: Option<(&[u8], u64)>) -> Result<()> {
+    pub fn tick(&mut self, frame: Option<(VideoMode, &[u8], u64)>) -> Result<bool> {
         unsafe {
             if !self.connected {
                 match ConnectNamedPipe(self.pipe.0, None) {
                     // In PIPE_NOWAIT mode this can mean a disconnected instance is
                     // available again. Only ERROR_PIPE_CONNECTED confirms a client.
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return Ok(false),
                     Err(error) if error.code() == ERROR_PIPE_CONNECTED.to_hresult() => {
                         self.connected = true
                     }
                     Err(error) if error.code() == ERROR_PIPE_LISTENING.to_hresult() => {
-                        return Ok(());
+                        return Ok(false);
                     }
                     Err(error)
                         if error.code()
                             == windows::Win32::Foundation::ERROR_NO_DATA.to_hresult() =>
                     {
                         let _ = DisconnectNamedPipe(self.pipe.0);
-                        return Ok(());
+                        return Ok(false);
                     }
                     Err(error) => return Err(error),
                 }
             }
-            let Some((pixels, age_ms)) = frame else {
-                return Ok(());
+            let Some((mode, pixels, age_ms)) = frame else {
+                return Ok(false);
             };
-            if pixels.len() != NV12_SIZE {
-                return Ok(());
-            }
             let captured = GetTickCount64().saturating_sub(age_ms);
-            self.message[..HEADER].copy_from_slice(&captured.to_le_bytes());
-            self.message[HEADER..].copy_from_slice(pixels);
+            encode_packet(mode, captured, pixels, &mut self.message)
+                .map_err(|_| windows::Win32::Foundation::E_INVALIDARG)?;
             let mut written = 0;
             // A nonblocking message pipe either writes the entire record or reports zero bytes.
             if WriteFile(self.pipe.0, Some(&self.message), Some(&mut written), None).is_err() {
                 let _ = DisconnectNamedPipe(self.pipe.0);
                 self.connected = false;
+                return Ok(false);
             }
-            Ok(())
+            Ok(written as usize == self.message.len())
         }
     }
 }
@@ -138,20 +140,22 @@ impl Publisher {
 #[cfg(feature = "com-server")]
 pub(crate) struct Reader {
     pipe: Option<Handle>,
+    mode: VideoMode,
     message: Vec<u8>,
+    rendered: Vec<u8>,
     blank: Vec<u8>,
     captured: Option<u64>,
 }
 
 #[cfg(feature = "com-server")]
 impl Reader {
-    pub(crate) fn new() -> Self {
-        let mut blank = vec![128; NV12_SIZE];
-        blank[..WIDTH * HEIGHT].fill(16);
+    pub(crate) fn new(mode: VideoMode) -> Self {
         Self {
             pipe: None,
-            message: vec![0; MESSAGE],
-            blank,
+            mode,
+            message: Vec::new(),
+            rendered: black_frame(mode),
+            blank: black_frame(mode),
             captured: None,
         }
     }
@@ -161,7 +165,7 @@ impl Reader {
         let now = unsafe { GetTickCount64() };
         match self.captured {
             Some(captured) if captured <= now && now - captured < MAX_FRAME_AGE_MS => {
-                &self.message[HEADER..]
+                &self.rendered
             }
             _ => &self.blank,
         }
@@ -183,37 +187,61 @@ impl Reader {
                 .ok()
                 .map(Handle);
             }
-            let Some(pipe) = &self.pipe else { return };
+            let Some(handle) = self.pipe.as_ref().map(|pipe| pipe.0) else {
+                return;
+            };
+            let mut received = false;
             for _ in 0..2 {
                 let mut available = 0;
                 let mut message_size = 0;
-                let peek = PeekNamedPipe(
-                    pipe.0,
+                if PeekNamedPipe(
+                    handle,
                     None,
                     0,
                     None,
                     Some(&mut available),
                     Some(&mut message_size),
-                );
-                if peek.is_ok() && available == 0 {
-                    return;
-                }
-                if peek.is_err() || message_size as usize != MESSAGE || available < message_size {
-                    self.pipe = None;
-                    self.captured = None;
-                    return;
-                }
-                let mut count = 0;
-                if ReadFile(pipe.0, Some(&mut self.message), Some(&mut count), None).is_err()
-                    || count as usize != MESSAGE
+                )
+                .is_err()
                 {
                     self.pipe = None;
                     self.captured = None;
                     return;
                 }
-                self.captured = Some(u64::from_le_bytes(
-                    self.message[..HEADER].try_into().unwrap(),
-                ));
+                if available == 0 {
+                    break;
+                }
+                if !(HEADER_SIZE..=MAX_PACKET_SIZE).contains(&(message_size as usize)) {
+                    self.pipe = None;
+                    self.captured = None;
+                    return;
+                }
+                if available < message_size {
+                    break;
+                }
+                self.message.resize(message_size as usize, 0);
+                let mut count = 0;
+                if ReadFile(handle, Some(&mut self.message), Some(&mut count), None).is_err()
+                    || count != message_size
+                {
+                    self.pipe = None;
+                    self.captured = None;
+                    return;
+                }
+                received = true;
+            }
+            if received {
+                match decode_packet(&self.message) {
+                    Ok((mode, captured, pixels))
+                        if render_nv12(pixels, mode, self.mode, &mut self.rendered).is_ok() =>
+                    {
+                        self.captured = Some(captured);
+                    }
+                    _ => {
+                        self.pipe = None;
+                        self.captured = None;
+                    }
+                }
             }
         }
     }

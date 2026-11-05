@@ -52,6 +52,10 @@ pub struct Camera {
 
 impl Camera {
     pub fn start() -> Result<Self> {
+        let installed = install_directory()?.join(DLL_NAME);
+        if SOURCE_DLL.is_empty() || fs::read(&installed).ok().as_deref() != Some(SOURCE_DLL) {
+            return Err("install this build's camera source first. To upgrade, stop camera apps, run uninstall-source, reboot if requested, then run install-source from elevated PowerShell".into());
+        }
         let mf = MediaFoundation::start()?;
         let clsid = HSTRING::from(format!("{{{CAMERA_CLSID:?}}}"));
         let camera = unsafe {

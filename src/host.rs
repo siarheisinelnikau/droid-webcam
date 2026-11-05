@@ -49,18 +49,27 @@ pub fn receive(
     };
     drop(listener);
     drop(pairing);
-    feed.set_state(State::Paired);
-    report(State::Paired, None);
+    let settings = receiver.settings();
+    let mode = settings.mode();
+    feed.configure(mode);
+    report(
+        State::Paired,
+        Some(&format!(
+            "{mode}, quality {}, {} camera",
+            settings.quality(),
+            if settings.front() { "front" } else { "rear" }
+        )),
+    );
 
     let result = (|| -> Result<()> {
         let mut frame = Vec::new();
         let mut first = true;
         while receiver.next_frame(&mut frame)? {
-            let pixels = decode_nv12(&frame)?;
+            let pixels = decode_nv12(&frame, mode)?;
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            feed.publish(pixels);
+            feed.publish(mode, pixels)?;
             receiver.acknowledge_frame()?;
             if first {
                 report(State::Streaming, None);
@@ -114,7 +123,9 @@ mod tests {
     #[test]
     fn loopback_stop_discards_frame() {
         let states = loopback(|mut sender, feed, _| {
-            sender.send(&synthetic_jpeg(0).unwrap()).unwrap();
+            sender
+                .send(&synthetic_jpeg(0, droid_camera_source::DEFAULT_MODE, 80).unwrap())
+                .unwrap();
             assert_eq!(feed.state(), State::Streaming);
             assert!(feed.latest().is_some());
             sender.stop().unwrap();
@@ -134,7 +145,9 @@ mod tests {
     fn loopback_disconnect_and_malformed_jpeg() {
         assert_eq!(
             loopback(|mut sender, _, _| {
-                sender.send(&synthetic_jpeg(0).unwrap()).unwrap();
+                sender
+                    .send(&synthetic_jpeg(0, droid_camera_source::DEFAULT_MODE, 80).unwrap())
+                    .unwrap();
                 drop(sender);
             }),
             [

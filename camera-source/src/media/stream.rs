@@ -1,11 +1,6 @@
 use super::{NULL_GUID, STREAM_ID, attributes, event_generator, queue_event};
-use crate::{FPS, HEIGHT, NV12_SIZE, WIDTH, pipe::Reader};
-use std::{
-    collections::VecDeque,
-    ptr,
-    sync::Mutex,
-    time::{Duration, Instant},
-};
+use crate::{DEFAULT_MODE, SUPPORTED_MODES, VideoMode, pipe::Reader};
+use std::{collections::VecDeque, ptr, sync::Mutex, time::Instant};
 use windows::Win32::Foundation::{E_NOTIMPL, S_OK};
 use windows::Win32::Media::KernelStreaming::PINNAME_VIDEO_CAPTURE;
 use windows::Win32::Media::MediaFoundation::*;
@@ -15,7 +10,6 @@ use windows::core::{
     implement,
 };
 
-const PERIOD: Duration = Duration::from_nanos(1_000_000_000 / FPS);
 const MAX_REQUESTS: usize = 8;
 
 #[implement(IMFMediaStream2)]
@@ -28,6 +22,7 @@ pub(super) struct Stream {
 }
 
 struct State {
+    mode: VideoMode,
     running: bool,
     shutdown: bool,
     next: Instant,
@@ -40,23 +35,15 @@ struct State {
 impl Stream {
     pub(super) fn create() -> Result<ComObject<Self>> {
         let (descriptor, attributes, events) = unsafe {
-            let media = MFCreateMediaType()?;
-            media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
-            media.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
-            media.SetUINT64(&MF_MT_FRAME_SIZE, (WIDTH as u64) << 32 | HEIGHT as u64)?;
-            media.SetUINT64(&MF_MT_FRAME_RATE, FPS << 32 | 1)?;
-            media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
-            media.SetUINT32(&MF_MT_DEFAULT_STRIDE, WIDTH as u32)?;
-            media.SetUINT32(&MF_MT_SAMPLE_SIZE, NV12_SIZE as u32)?;
-            media.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
-            media.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
-            media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
-            media.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
-            media.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT601.0 as u32)?;
-            let descriptor = MFCreateStreamDescriptor(STREAM_ID, &[Some(media.clone())])?;
+            let media_types = SUPPORTED_MODES
+                .iter()
+                .copied()
+                .map(|mode| create_media_type(mode).map(Some))
+                .collect::<Result<Vec<_>>>()?;
+            let descriptor = MFCreateStreamDescriptor(STREAM_ID, &media_types)?;
             descriptor
                 .GetMediaTypeHandler()?
-                .SetCurrentMediaType(&media)?;
+                .SetCurrentMediaType(media_types[0].as_ref())?;
             let attributes = attributes(4)?;
             attributes.SetGUID(&MF_DEVICESTREAM_STREAM_CATEGORY, &PINNAME_VIDEO_CAPTURE)?;
             attributes.SetUINT32(&MF_DEVICESTREAM_STREAM_ID, STREAM_ID)?;
@@ -74,6 +61,7 @@ impl Stream {
             events,
             source: Mutex::new(Weak::new()),
             state: Mutex::new(State {
+                mode: DEFAULT_MODE,
                 running: false,
                 shutdown: false,
                 next: Instant::now(),
@@ -90,8 +78,10 @@ impl Stream {
         Ok(())
     }
 
-    pub(super) fn start(&self, time: &PROPVARIANT) -> Result<()> {
+    pub(super) fn start(&self, time: &PROPVARIANT, mode: VideoMode) -> Result<()> {
         let mut state = self.state.lock().unwrap();
+        state.set_running(false);
+        state.mode = mode;
         state.set_running(true);
         queue_event(&self.events, MEStreamStarted, time)
     }
@@ -119,7 +109,7 @@ impl State {
         }
         self.running = running;
         self.next = Instant::now();
-        self.reader = running.then(Reader::new);
+        self.reader = running.then(|| Reader::new(self.mode));
         self.requests.clear();
         self.generation = self.generation.wrapping_add(1);
         if let Some(key) = self.scheduled.take() {
@@ -239,9 +229,11 @@ impl IMFAsyncCallback_Impl for SampleWork_Impl {
         let Some(token) = state.requests.pop_front() else {
             return Ok(());
         };
-        state.next = Instant::now() + PERIOD;
+        let mode = state.mode;
+        state.next = (state.next + mode.period()).max(Instant::now());
         let result = emit_sample(
             &stream.events,
+            mode,
             state.reader.as_mut().unwrap().latest(),
             token,
         )
@@ -261,20 +253,68 @@ impl IMFAsyncCallback_Impl for SampleWork_Impl {
     }
 }
 
+pub(super) fn mode_from_media(media: &IMFMediaType) -> Result<VideoMode> {
+    unsafe {
+        if media.GetGUID(&MF_MT_MAJOR_TYPE)? != MFMediaType_Video
+            || media.GetGUID(&MF_MT_SUBTYPE)? != MFVideoFormat_NV12
+        {
+            return Err(MF_E_INVALIDMEDIATYPE.into());
+        }
+        let size = media.GetUINT64(&MF_MT_FRAME_SIZE)?;
+        let rate = media.GetUINT64(&MF_MT_FRAME_RATE)?;
+        if rate as u32 != 1
+            || (size >> 32) > u16::MAX as u64
+            || (size as u32) > u16::MAX as u32
+            || (rate >> 32) > u16::MAX as u64
+        {
+            return Err(MF_E_INVALIDMEDIATYPE.into());
+        }
+        VideoMode::new((size >> 32) as u16, size as u16, (rate >> 32) as u16)
+            .map_err(|_| MF_E_INVALIDMEDIATYPE.into())
+    }
+}
+
+fn create_media_type(mode: VideoMode) -> Result<IMFMediaType> {
+    unsafe {
+        let media = MFCreateMediaType()?;
+        media.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
+        media.SetGUID(&MF_MT_SUBTYPE, &MFVideoFormat_NV12)?;
+        media.SetUINT64(
+            &MF_MT_FRAME_SIZE,
+            (mode.width() as u64) << 32 | mode.height() as u64,
+        )?;
+        media.SetUINT64(&MF_MT_FRAME_RATE, u64::from(mode.fps()) << 32 | 1)?;
+        media.SetUINT64(&MF_MT_PIXEL_ASPECT_RATIO, (1u64 << 32) | 1)?;
+        media.SetUINT32(&MF_MT_DEFAULT_STRIDE, mode.width() as u32)?;
+        media.SetUINT32(&MF_MT_SAMPLE_SIZE, mode.nv12_size() as u32)?;
+        media.SetUINT32(&MF_MT_FIXED_SIZE_SAMPLES, 1)?;
+        media.SetUINT32(&MF_MT_ALL_SAMPLES_INDEPENDENT, 1)?;
+        media.SetUINT32(&MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive.0 as u32)?;
+        media.SetUINT32(&MF_MT_VIDEO_NOMINAL_RANGE, MFNominalRange_16_235.0 as u32)?;
+        media.SetUINT32(&MF_MT_YUV_MATRIX, MFVideoTransferMatrix_BT601.0 as u32)?;
+        Ok(media)
+    }
+}
+
 fn emit_sample(
     events: &IMFMediaEventQueue,
+    mode: VideoMode,
     pixels: &[u8],
     token: Option<AgileReference<IUnknown>>,
 ) -> Result<()> {
     unsafe {
         let sample = MFCreateSample()?;
-        let buffer =
-            MFCreate2DMediaBuffer(WIDTH as u32, HEIGHT as u32, MFVideoFormat_NV12.data1, false)?;
+        let buffer = MFCreate2DMediaBuffer(
+            mode.width() as u32,
+            mode.height() as u32,
+            MFVideoFormat_NV12.data1,
+            false,
+        )?;
         buffer.cast::<IMF2DBuffer>()?.ContiguousCopyFrom(pixels)?;
-        buffer.SetCurrentLength(NV12_SIZE as u32)?;
+        buffer.SetCurrentLength(mode.nv12_size() as u32)?;
         sample.AddBuffer(&buffer)?;
         sample.SetSampleTime(MFGetSystemTime())?;
-        sample.SetSampleDuration(10_000_000 / FPS as i64)?;
+        sample.SetSampleDuration(10_000_000 / i64::from(mode.fps()))?;
         sample.SetUINT32(&MFSampleExtension_CleanPoint, 1)?;
         if let Some(token) = token {
             sample.SetUnknown(&MFSampleExtension_Token, &token.resolve()?)?;
