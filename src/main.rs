@@ -140,8 +140,8 @@ fn send_test(count: usize) -> Result<()> {
 
 #[cfg(windows)]
 struct CameraPublisher {
-    pipe: droid_camera_source::pipe::Publisher,
     _camera: windows_host::Camera,
+    pipe: droid_camera_source::pipe::Publisher,
 }
 
 #[cfg(windows)]
