@@ -11,6 +11,14 @@ The default is **720p at 30 FPS with Balanced quality**, when supported by the p
 
 The connection runs directly on the LAN with a single-use invitation and pinned TLS 1.3. The desktop receiver and both camera backends are Rust. Android uses a small Java layer for Camera2, JPEG encoding, and platform TLS.
 
+## GitHub releases
+
+The [Release workflow](https://github.com/siarheisinelnikau/droid-webcam/actions/workflows/release.yml) builds Windows x64, Ubuntu x64, and Android downloads on GitHub-hosted runners. It runs Rust tests and the Java/Rust transport checks, generates SHA-256 checksums, and publishes a preview release after all jobs pass.
+
+Run it manually from **Actions → Release → Run workflow** with a tag matching the Rust and Android package version, such as `v0.2.0`. A manual run builds the selected workflow ref and creates that tag after the build succeeds. Pushing a `v*` tag also starts a release build. Add matching notes under `docs/releases/<tag>.md` before starting. Existing published releases and tags pointing to a different commit are preserved.
+
+The APK uses a fresh debug signing key for each Actions build. Uninstall a differently signed earlier APK before installing the download.
+
 ## Build
 
 ### Windows
