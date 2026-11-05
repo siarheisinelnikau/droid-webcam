@@ -1,4 +1,7 @@
-use super::{NULL_GUID, STREAM_ID, attributes, event_generator, queue_event, stream::Stream};
+use super::{
+    NULL_GUID, STREAM_ID, attributes, event_generator, queue_event,
+    stream::{Stream, mode_from_media},
+};
 use std::{ffi::c_void, mem::ManuallyDrop, ptr, sync::Mutex};
 use windows::Win32::Foundation::{E_INVALIDARG, E_POINTER, ERROR_SET_NOT_FOUND, S_OK};
 use windows::Win32::Media::KernelStreaming::{
@@ -39,7 +42,7 @@ impl Source {
                 &MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_GUID,
             )?;
             let profile = MFCreateSensorProfile(&KSCAMERAPROFILE_Legacy, 0, PCWSTR::null())?;
-            profile.AddProfileFilter(STREAM_ID, w!("((RES==;FRT<=30,1;SUT==))"))?;
+            profile.AddProfileFilter(STREAM_ID, w!("((RES==;FRT<=60,1;SUT==))"))?;
             let profiles = MFCreateSensorProfileCollection()?;
             profiles.AddProfile(&profile)?;
             attributes.SetUnknown(&MF_DEVICEMFT_SENSORPROFILE_COLLECTION, &profiles)?;
@@ -124,22 +127,11 @@ impl IMFMediaSource_Impl for Source_Impl {
                 return Err(E_INVALIDARG.into());
             }
             let media = stream.GetMediaTypeHandler()?.GetCurrentMediaType()?;
-            let advertised = self
-                .stream
+            let mode = mode_from_media(&media)?;
+            self.stream
                 .descriptor
                 .GetMediaTypeHandler()?
-                .GetMediaTypeByIndex(0)?;
-            let fields = media.IsEqual(&advertised)?;
-            if fields
-                & (MF_MEDIATYPE_EQUAL_MAJOR_TYPES
-                    | MF_MEDIATYPE_EQUAL_FORMAT_TYPES
-                    | MF_MEDIATYPE_EQUAL_FORMAT_DATA)
-                != (MF_MEDIATYPE_EQUAL_MAJOR_TYPES
-                    | MF_MEDIATYPE_EQUAL_FORMAT_TYPES
-                    | MF_MEDIATYPE_EQUAL_FORMAT_DATA)
-            {
-                return Err(MF_E_INVALIDMEDIATYPE.into());
-            }
+                .SetCurrentMediaType(&media)?;
 
             let event = if *status == Status::Initial {
                 MENewStream
@@ -150,7 +142,7 @@ impl IMFMediaSource_Impl for Source_Impl {
             self.events
                 .QueueEventParamUnk(event.0 as u32, &NULL_GUID, S_OK, &*stream)?;
             let time = event_time();
-            self.stream.start(&time)?;
+            self.stream.start(&time, mode)?;
             *status = Status::Started;
             queue_event(&self.events, MESourceStarted, &time)
         }

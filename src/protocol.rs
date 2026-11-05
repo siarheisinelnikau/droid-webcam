@@ -1,4 +1,5 @@
 //! A single-use invitation for a pinned TLS 1.3 session. All framing is inside TLS.
+use droid_camera_source::{DEFAULT_MODE, LEGACY_MODE, VideoMode};
 use ring::{digest, rand};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
@@ -15,20 +16,84 @@ use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 use zeroize::Zeroizing;
 
-pub const MAX_JPEG: usize = 256 * 1024;
+pub const MAX_JPEG: usize = 3 * 1024 * 1024;
+const LEGACY_MAX_JPEG: usize = 256 * 1024;
 pub const PAIR_TIMEOUT: Duration = Duration::from_secs(8);
 pub const INVITE_LIFETIME: Duration = Duration::from_secs(180);
 const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(10);
 const FRAME_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL: Duration = Duration::from_millis(125);
-const MAGIC: [u8; 4] = *b"DW01";
+const MAGIC: [u8; 4] = *b"DW02";
+const LEGACY_MAGIC: [u8; 4] = *b"DW01";
 const ACCEPT: [u8; 4] = *b"DWOK";
 const CREDIT: u8 = 1;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureSettings {
+    mode: VideoMode,
+    quality: u8,
+    front: bool,
+}
+
+impl Default for CaptureSettings {
+    fn default() -> Self {
+        Self {
+            mode: DEFAULT_MODE,
+            quality: 80,
+            front: false,
+        }
+    }
+}
+
+impl CaptureSettings {
+    pub const LEGACY: Self = Self {
+        mode: LEGACY_MODE,
+        quality: 75,
+        front: false,
+    };
+    pub fn new(mode: VideoMode, quality: u8, front: bool) -> Result<Self> {
+        if !(40..=95).contains(&quality) {
+            return Err("JPEG quality must be between 40 and 95".into());
+        }
+        Ok(Self {
+            mode,
+            quality,
+            front,
+        })
+    }
+    pub fn mode(self) -> VideoMode {
+        self.mode
+    }
+    pub fn quality(self) -> u8 {
+        self.quality
+    }
+    pub fn front(self) -> bool {
+        self.front
+    }
+    pub fn wire(self) -> [u8; 8] {
+        let mut bytes = [0; 8];
+        bytes[..6].copy_from_slice(&self.mode.wire());
+        bytes[6] = self.quality;
+        bytes[7] = u8::from(self.front);
+        bytes
+    }
+    pub fn from_wire(bytes: [u8; 8]) -> Result<Self> {
+        if bytes[7] > 1 {
+            return Err("invalid camera selection".into());
+        }
+        Self::new(
+            VideoMode::from_wire(bytes[..6].try_into().unwrap())?,
+            bytes[6],
+            bytes[7] == 1,
+        )
+    }
+}
+
 pub struct Invite {
+    version: u8,
     pub address: SocketAddrV4,
     pin: [u8; 32],
     secret: Zeroizing<[u8; 32]>,
@@ -37,7 +102,7 @@ pub struct Invite {
 impl Invite {
     pub fn parse(code: &str) -> Result<Self> {
         let parts: Vec<_> = code.trim().splitn(6, ':').collect();
-        let ["droidcam", "1", ip, port, pin, secret] = parts.as_slice() else {
+        let ["droidcam", version @ ("1" | "2"), ip, port, pin, secret] = parts.as_slice() else {
             return Err("invalid Droid Webcam invitation".into());
         };
         let address: SocketAddrV4 = format!("{ip}:{port}").parse()?;
@@ -49,6 +114,7 @@ impl Invite {
             return Err("invitation needs a unicast IPv4 address and port".into());
         }
         let mut invite = Self {
+            version: version.parse()?,
             address,
             pin: [0; 32],
             secret: Zeroizing::new([0; 32]),
@@ -60,7 +126,8 @@ impl Invite {
 
     pub fn code(&self) -> Zeroizing<String> {
         Zeroizing::new(format!(
-            "droidcam:1:{}:{}:{}",
+            "droidcam:{}:{}:{}:{}",
+            self.version,
             self.address,
             hex::encode(self.pin),
             *Zeroizing::new(hex::encode(&self.secret[..]))
@@ -95,6 +162,7 @@ impl Pairing {
         Ok(Self {
             config: Arc::new(config),
             invite: Invite {
+                version: 2,
                 address,
                 pin,
                 secret,
@@ -128,7 +196,9 @@ impl Pairing {
         );
         let mut proof = Zeroizing::new([0; 36]);
         tls.read_exact(&mut *proof)?;
-        if proof[..4] != MAGIC || !bool::from(proof[4..].ct_eq(&*self.invite.secret)) {
+        if (proof[..4] != MAGIC && proof[..4] != LEGACY_MAGIC)
+            || !bool::from(proof[4..].ct_eq(&*self.invite.secret))
+        {
             return Err("pairing proof rejected".into());
         }
         if self.expired() {
@@ -137,50 +207,92 @@ impl Pairing {
         // Consume before sending the acknowledgement, including if the peer closes early.
         self.used = true;
         self.invite.secret.fill(0);
+        let legacy = proof[..4] == LEGACY_MAGIC;
+        let settings = if legacy {
+            CaptureSettings::LEGACY
+        } else {
+            let mut bytes = [0; 8];
+            tls.read_exact(&mut bytes)?;
+            CaptureSettings::from_wire(bytes)?
+        };
         tls.write_all(&ACCEPT)?;
+        if !legacy {
+            tls.write_all(&settings.wire())?;
+        }
         tls.flush()?;
-        Ok(Receiver(tls))
+        Ok(Receiver {
+            tls,
+            settings,
+            max_jpeg: if legacy { LEGACY_MAX_JPEG } else { MAX_JPEG },
+            first: true,
+        })
     }
 }
 
-pub struct Receiver(rustls::StreamOwned<ServerConnection, TimedSocket>);
+pub struct Receiver {
+    tls: rustls::StreamOwned<ServerConnection, TimedSocket>,
+    settings: CaptureSettings,
+    max_jpeg: usize,
+    first: bool,
+}
 
 impl Receiver {
+    pub fn settings(&self) -> CaptureSettings {
+        self.settings
+    }
+
     /// Returns false on an authenticated, explicit stop. EOF is a disconnect.
     pub fn next_frame(&mut self, frame: &mut Vec<u8>) -> Result<bool> {
-        let timeout = if frame.is_empty() {
+        let timeout = if self.first {
             FIRST_FRAME_TIMEOUT
         } else {
             FRAME_TIMEOUT
         };
-        self.0.sock.deadline = Instant::now() + timeout;
-        read_frame(&mut self.0, frame)
+        self.tls.sock.deadline = Instant::now() + timeout;
+        let received = read_frame(&mut self.tls, frame, self.max_jpeg)?;
+        self.first = false;
+        Ok(received)
     }
 
     pub fn acknowledge_frame(&mut self) -> Result<()> {
-        self.0.sock.deadline = Instant::now() + FRAME_TIMEOUT;
-        self.0.write_all(&[CREDIT])?;
-        self.0.flush()?;
+        self.tls.sock.deadline = Instant::now() + FRAME_TIMEOUT;
+        self.tls.write_all(&[CREDIT])?;
+        self.tls.flush()?;
         Ok(())
     }
 }
 
-fn read_frame(reader: &mut impl Read, frame: &mut Vec<u8>) -> Result<bool> {
+fn read_frame(reader: &mut impl Read, frame: &mut Vec<u8>, max_jpeg: usize) -> Result<bool> {
     let mut header = [0; 4];
     reader.read_exact(&mut header)?;
     let size = u32::from_be_bytes(header) as usize;
-    if size > MAX_JPEG {
-        return Err("frame exceeds 256 KiB".into());
+    if size > max_jpeg {
+        return Err("frame exceeds the negotiated size limit".into());
     }
     frame.resize(size, 0);
     reader.read_exact(frame)?;
     Ok(size != 0)
 }
 
-pub struct Sender(rustls::StreamOwned<ClientConnection, TimedSocket>);
+pub struct Sender {
+    tls: rustls::StreamOwned<ClientConnection, TimedSocket>,
+    max_jpeg: usize,
+}
 
 impl Sender {
     pub fn connect(invite: &Invite) -> Result<Self> {
+        let settings = if invite.version == 1 {
+            CaptureSettings::LEGACY
+        } else {
+            CaptureSettings::default()
+        };
+        Self::connect_with_settings(invite, settings)
+    }
+
+    pub fn connect_with_settings(invite: &Invite, settings: CaptureSettings) -> Result<Self> {
+        if invite.version == 1 && settings != CaptureSettings::LEGACY {
+            return Err("a legacy host only supports the original capture mode".into());
+        }
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let config = ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -197,25 +309,46 @@ impl Sender {
             TimedSocket::new(socket, Arc::new(AtomicBool::new(false)), deadline)?,
         );
         let mut proof = Zeroizing::new([0; 36]);
-        proof[..4].copy_from_slice(&MAGIC);
+        proof[..4].copy_from_slice(if invite.version == 1 {
+            &LEGACY_MAGIC
+        } else {
+            &MAGIC
+        });
         proof[4..].copy_from_slice(&*invite.secret);
         tls.write_all(&*proof)?;
+        if invite.version == 2 {
+            tls.write_all(&settings.wire())?;
+        }
         tls.flush()?;
         let mut acknowledgement = [0; 4];
         tls.read_exact(&mut acknowledgement)?;
         if acknowledgement != ACCEPT {
             return Err("unexpected pairing acknowledgement".into());
         }
-        Ok(Self(tls))
+        if invite.version == 2 {
+            let mut accepted = [0; 8];
+            tls.read_exact(&mut accepted)?;
+            if CaptureSettings::from_wire(accepted)? != settings {
+                return Err("host changed the capture settings".into());
+            }
+        }
+        Ok(Self {
+            tls,
+            max_jpeg: if invite.version == 1 {
+                LEGACY_MAX_JPEG
+            } else {
+                MAX_JPEG
+            },
+        })
     }
 
     pub fn send(&mut self, jpeg: &[u8]) -> Result<()> {
-        if jpeg.is_empty() || jpeg.len() > MAX_JPEG {
+        if jpeg.is_empty() || jpeg.len() > self.max_jpeg {
             return Err("invalid JPEG record length".into());
         }
         self.write(jpeg)?;
         let mut credit = [0; 1];
-        self.0.read_exact(&mut credit)?;
+        self.tls.read_exact(&mut credit)?;
         if credit != [CREDIT] {
             return Err("unexpected frame acknowledgement".into());
         }
@@ -227,10 +360,10 @@ impl Sender {
     }
 
     fn write(&mut self, payload: &[u8]) -> Result<()> {
-        self.0.sock.deadline = Instant::now() + FRAME_TIMEOUT;
-        self.0.write_all(&(payload.len() as u32).to_be_bytes())?;
-        self.0.write_all(payload)?;
-        self.0.flush()?;
+        self.tls.sock.deadline = Instant::now() + FRAME_TIMEOUT;
+        self.tls.write_all(&(payload.len() as u32).to_be_bytes())?;
+        self.tls.write_all(payload)?;
+        self.tls.flush()?;
         Ok(())
     }
 }
@@ -400,12 +533,61 @@ mod tests {
     }
 
     #[test]
+    fn settings_reject_unsupported_dimensions_rates_quality_and_camera() {
+        for mode in droid_camera_source::SUPPORTED_MODES {
+            for quality in [40, 55, 80, 95] {
+                for front in [false, true] {
+                    let settings = CaptureSettings::new(mode, quality, front).unwrap();
+                    assert_eq!(
+                        CaptureSettings::from_wire(settings.wire()).unwrap(),
+                        settings
+                    );
+                }
+            }
+        }
+        let valid = CaptureSettings::default().wire();
+        for (index, value) in [(0, 255), (4, 255), (5, 0), (6, 0), (6, 96), (7, 2)] {
+            let mut invalid = valid;
+            invalid[index] = value;
+            assert!(CaptureSettings::from_wire(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_authenticated_settings_consume_the_invitation() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let std::net::SocketAddr::V4(address) = listener.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut pairing = Pairing::new(address).unwrap();
+        let invite = Invite::parse(&pairing.invite().code()).unwrap();
+        let task = thread::spawn(move || {
+            assert!(
+                pairing
+                    .accept(
+                        listener.accept().unwrap().0,
+                        Arc::new(AtomicBool::new(false))
+                    )
+                    .is_err()
+            );
+            assert!(pairing.used());
+        });
+        let invalid = CaptureSettings {
+            mode: DEFAULT_MODE,
+            quality: 0,
+            front: false,
+        };
+        assert!(Sender::connect_with_settings(&invite, invalid).is_err());
+        task.join().unwrap();
+    }
+
+    #[test]
     fn oversized_and_truncated_records_are_rejected() {
         let mut frame = Vec::new();
         let header = (MAX_JPEG as u32 + 1).to_be_bytes();
-        assert!(read_frame(&mut &header[..], &mut frame).is_err());
+        assert!(read_frame(&mut &header[..], &mut frame, MAX_JPEG).is_err());
         assert_eq!(frame.capacity(), 0);
-        assert!(read_frame(&mut &[0, 0, 0, 2, 1][..], &mut frame).is_err());
-        assert!(read_frame(&mut &[0, 0][..], &mut frame).is_err());
+        assert!(read_frame(&mut &[0, 0, 0, 2, 1][..], &mut frame, MAX_JPEG).is_err());
+        assert!(read_frame(&mut &[0, 0][..], &mut frame, MAX_JPEG).is_err());
     }
 }
