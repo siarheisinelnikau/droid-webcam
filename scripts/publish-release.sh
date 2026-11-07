@@ -18,7 +18,7 @@ test -f "$notes"
 files=(
     "DroidWebcam-$RELEASE_VERSION-windows-x86_64.zip"
     "DroidWebcam-$RELEASE_VERSION-ubuntu-x86_64.tar.gz"
-    "DroidWebcam-$RELEASE_VERSION-android-debug.apk"
+    "DroidWebcam-$RELEASE_VERSION-android.apk"
 )
 for file in "${files[@]}"; do test -s "release/$file"; done
 (cd release && sha256sum "${files[@]}" > SHA256SUMS.txt && sha256sum --check SHA256SUMS.txt)
