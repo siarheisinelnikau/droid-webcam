@@ -27,6 +27,13 @@ On 2026-11-07, the encrypted keystore, local password file, public certificate, 
 
 ## Builds and updates
 
+### Release from any computer
+
+1. Commit a new version in both Rust package manifests and `Cargo.lock`, update Android `versionName`, increment Android `versionCode`, and add matching notes in `docs/releases/vVERSION.md`. Previously published versions and tags must not be reused.
+2. Open **Actions → Release → Run workflow** in GitHub, select `main`, and enter the matching `vVERSION` tag. Repository Actions access is required; no local SDK, keystore, or CLI login is needed.
+3. Leave **Publish a new version after build and signing checks** unchecked to build and sign all artifacts without creating a release. The Android APK is verified against the permanent certificate before upload as an artifact.
+4. Enable that option to publish a prepared new version. The workflow builds Windows, Ubuntu, and Android packages, signs the APK, checks the artifacts, and publishes the preview release with checksums. A `v*` tag-push trigger retains the existing automatic-publication behavior.
+
 `android/build.sh` defaults to local debug signing. `android/build.sh unsigned` compiles and aligns an APK without any signing credential. The GitHub build job uses this mode. A separate GitHub-hosted `android-sign` job declares the `release` environment, decodes the keystore into an owner-only temporary file, and calls `android/sign-apk.sh release INPUT.apk OUTPUT.apk`. Passwords reach `apksigner` through environment variables, not process arguments. The temporary keystore is removed on exit. Only the signed APK is passed to the release-publishing job.
 
 The signer verifies both the APK signature and the committed certificate digest. Missing secrets, invalid signatures, and a different certificate stop publication; no debug fallback is permitted for releases. Signing follows zip alignment. Changes after signing would invalidate the APK signature.

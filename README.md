@@ -15,7 +15,9 @@ The connection runs directly on the LAN with a single-use invitation and pinned 
 
 The [Release workflow](https://github.com/siarheisinelnikau/droid-webcam/actions/workflows/release.yml) builds Windows x64, Ubuntu x64, and Android downloads on GitHub-hosted runners. It runs Rust tests and the Java/Rust transport checks, generates SHA-256 checksums, and publishes a preview release after all jobs pass.
 
-Run it manually from **Actions → Release → Run workflow** with a tag matching the Rust and Android package version, such as `v0.2.0`. A manual run builds the selected workflow ref and creates that tag after the build succeeds. Pushing a `v*` tag also starts a release build. Add matching notes under `docs/releases/<tag>.md` before starting. Existing published releases and tags pointing to a different commit are preserved.
+Run it manually from **Actions → Release → Run workflow** with a tag matching the Rust and Android package version, such as `v0.2.0`. A manual run builds the selected workflow ref; publishing runs create the tag after all build and signing checks succeed. Pushing a `v*` tag also starts a release build. Add matching notes under `docs/releases/<tag>.md` before starting. Existing published releases and tags pointing to a different commit are preserved.
+
+Manual runs default to a build-and-sign verification. Leave **Publish a new version after build and signing checks** unchecked to download signed artifacts without changing releases; enable it to publish a prepared, new version. This works from any computer with repository Actions access: the runners provide the toolchains and release identity. A tag-push run still publishes automatically after its checks pass. Use `main` or an allowed `v*` tag for access to the `release` environment.
 
 Release APKs use a permanent certificate and the `release` GitHub environment. Build jobs do not receive signing credentials. The signing job checks the public certificate digest in `release/android-signing-cert.sha256` and stops if credentials are missing or the certificate changes. See [release signing and backup](docs/signing.md) for initial setup and recovery.
 

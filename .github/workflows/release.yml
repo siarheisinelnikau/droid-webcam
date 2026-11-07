@@ -11,6 +11,11 @@ run-name: Release ${{ inputs.tag || github.ref_name }}
         required: true
         default: v0.2.0
         type: string
+      publish:
+        description: Publish a new version after build and signing checks
+        type: boolean
+        required: true
+        default: false
 
 permissions:
   contents: read
@@ -206,6 +211,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
+    if: github.event_name != 'workflow_dispatch' || inputs.publish
     needs: [prepare, windows, ubuntu, android-sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
