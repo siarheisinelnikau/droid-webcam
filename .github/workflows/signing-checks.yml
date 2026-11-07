@@ -1,0 +1,32 @@
+name: Signing checks
+
+'on':
+  pull_request:
+    paths: ['android/**', 'release/**', 'scripts/*signing*.py', '.github/workflows/*']
+  push:
+    branches: [main]
+    paths: ['android/**', 'release/**', 'scripts/*signing*.py', '.github/workflows/*']
+
+permissions:
+  contents: read
+
+jobs:
+  signing:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Check scripts and credential handling without release secrets
+        run: |
+          bash -n android/build.sh android/sign-apk.sh scripts/publish-release.sh
+          python3 android/tests/signing.py
+          python3 - <<'PY'
+          import ast, hashlib, pathlib, subprocess
+          for path in pathlib.Path('scripts').glob('*signing*.py'):
+              ast.parse(path.read_text(), filename=str(path))
+          certificate = subprocess.check_output(['openssl', 'x509', '-in', 'release/android-signing-cert.pem', '-outform', 'DER'])
+          expected = pathlib.Path('release/android-signing-cert.sha256').read_text().strip()
+          assert hashlib.sha256(certificate).hexdigest() == expected
+          PY
