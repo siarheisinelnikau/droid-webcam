@@ -23,7 +23,7 @@ python3 scripts/upload-signing-secrets.py
 
 Use absolute script paths from another directory. The uploader unlocks the store, checks the public certificate against the committed digest, uploads values to `siarheisinelnikau/droid-webcam` / `release` through stdin, and verifies all three secret names. It does not print values or put passwords in command arguments. Existing signing secrets require explicit `--replace`; an interrupted three-secret upload can be retried with that flag after checking the same local identity.
 
-The setup on 2026-11-07 created the encrypted keystore, local password file, public certificate, and the GitHub environment with ref restrictions. **The three secret values still need to be uploaded with the command above:** the connected GitHub app has no Secrets API tool, and this workspace has no authenticated GitHub CLI. The real SDK signing job still needs its first remote validation run after upload and merge.
+The setup on 2026-11-07 created the encrypted keystore, local password file, public certificate, and the GitHub environment with ref restrictions. **The three secret values are still pending entry.** They can be entered through the already authenticated GitHub environment settings page; the CLI uploader above is an optional alternative. No additional CLI login is required when using that page. Configure all three secrets before the next release: publication deliberately stops without them. The real SDK signing job still needs its first remote validation run after setup.
 
 ## Builds and updates
 
