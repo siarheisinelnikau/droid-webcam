@@ -17,7 +17,9 @@ The [Release workflow](https://github.com/siarheisinelnikau/droid-webcam/actions
 
 Run it manually from **Actions → Release → Run workflow** with a tag matching the Rust and Android package version, such as `v0.2.0`. A manual run builds the selected workflow ref and creates that tag after the build succeeds. Pushing a `v*` tag also starts a release build. Add matching notes under `docs/releases/<tag>.md` before starting. Existing published releases and tags pointing to a different commit are preserved.
 
-The APK uses a fresh debug signing key for each Actions build. Uninstall a differently signed earlier APK before installing the download.
+Release APKs use a permanent certificate and the `release` GitHub environment. Build jobs do not receive signing credentials. The signing job checks the public certificate digest in `release/android-signing-cert.sha256` and stops if credentials are missing or the certificate changes. See [release signing and backup](docs/signing.md) for initial setup and recovery.
+
+Switching from an older debug-signed APK to the first release-signed APK requires uninstalling the older app, which removes its app data. Later release APKs can update the installed release app with the same certificate and a nondecreasing Android version code. Do not replace an existing published release to make this transition.
 
 ## Build
 

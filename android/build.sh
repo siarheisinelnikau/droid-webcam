@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
+mode="${1:-debug}"
+case "$mode" in
+    debug|release|unsigned) ;;
+    *) printf '%s\n' 'Usage: android/build.sh [debug|release|unsigned]' >&2; exit 1 ;;
+esac
 
 sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
 : "${sdk:?Set ANDROID_HOME to your Android SDK directory}"
@@ -20,12 +25,8 @@ jar cf build/classes.jar -C build/classes .
 cp build/resources.apk build/unsigned.apk
 (cd build/dex && zip -q ../unsigned.apk classes.dex)
 "$tools/zipalign" -f 4 build/unsigned.apk build/aligned.apk
-keystore="$PWD/build/debug.keystore"
-if [[ ! -f "$keystore" ]]; then
-    keytool -genkeypair -keystore "$keystore" -storepass android -keypass android \
-        -alias androiddebugkey -dname 'CN=Android Debug,O=Droid Webcam' -keyalg RSA -keysize 2048 -validity 10000
+if [[ "$mode" == unsigned ]]; then
+    printf '%s\n' "Built unsigned $PWD/build/aligned.apk"
+    exit 0
 fi
-"$tools/apksigner" sign --ks "$keystore" --ks-pass pass:android --key-pass pass:android \
-    --out build/DroidWebcam-debug.apk build/aligned.apk
-"$tools/apksigner" verify build/DroidWebcam-debug.apk
-printf '%s\n' "Built $PWD/build/DroidWebcam-debug.apk"
+./sign-apk.sh "$mode" build/aligned.apk "build/DroidWebcam-$mode.apk"

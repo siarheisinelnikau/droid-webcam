@@ -147,12 +147,56 @@ jobs:
       - name: Install Android SDK components
         run: |
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Build and verify debug-signed APK
+      - name: Build aligned unsigned APK
         run: |
-          ./android/build.sh
-          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose android/build/DroidWebcam-debug.apk
+          python3 android/tests/signing.py
+          ./android/build.sh unsigned
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: unsigned-android
+          path: android/build/aligned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  android-sign:
+    name: Sign Android release APK
+    needs: [prepare, android]
+    runs-on: ubuntu-24.04
+    environment: release
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.prepare.outputs.commit }}
+          persist-credentials: false
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install signing tools
+        run: '"$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;35.0.0"'
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: unsigned-android
+          path: unsigned-android
+      - name: Sign APK with the pinned release identity
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          set +x
+          : "${ANDROID_KEYSTORE_BASE64:?Configure Android signing secrets in the release environment}"
+          umask 077
+          ANDROID_KEYSTORE_PATH="$(mktemp "$RUNNER_TEMP/droid-webcam-signing.XXXXXX.p12")"
+          export ANDROID_KEYSTORE_PATH
+          trap 'rm -f -- "$ANDROID_KEYSTORE_PATH"' EXIT
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_KEYSTORE_PATH"
+          unset ANDROID_KEYSTORE_BASE64
           mkdir -p release
-          cp android/build/DroidWebcam-debug.apk "release/DroidWebcam-$VERSION-android-debug.apk"
+          bash android/sign-apk.sh release unsigned-android/aligned.apk "release/DroidWebcam-$VERSION-android.apk"
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: release-android
@@ -162,7 +206,7 @@ jobs:
 
   publish:
     name: Publish GitHub release
-    needs: [prepare, windows, ubuntu, android]
+    needs: [prepare, windows, ubuntu, android-sign]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
